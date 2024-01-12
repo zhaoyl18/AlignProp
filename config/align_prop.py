@@ -116,14 +116,26 @@ def aesthetic():
     config.max_vis_images = 4
     config.train.adam_weight_decay = 0.1
     
-    config.save_freq = 1
-    config.num_epochs = 7
-    config.num_checkpoint_limit = 14
+    config.train.kl_weight = 0 # Adjust this to different regularization level.
+            # Note that in computing loss, rewards are rescaled with config.train.loss_coeff=0.01
+            # so the "equivalent" alpha i: config.train.kl_weight/0.01
+    
+    config.sample_eta = 1.0  # This is to ensure we have noise during sampling
+    
+    config.save_freq = 5
+    
+    config.num_epochs = 60
+    config.num_checkpoint_limit = 20
     config.truncated_backprop_rand = True
     config.truncated_backprop_minmax = (0,50)
     config.trunc_backprop_timestep = 40
-    config.truncated_backprop = True
-    config = set_config_batch(config,total_samples_per_epoch=256,total_batch_size= 128, per_gpu_capacity=4)
+    
+    config.truncated_backprop = True  # If you want full backward prop and no truncation, set to False
+    
+    config = set_config_batch(config,
+                              total_samples_per_epoch=256,
+                              total_batch_size= 128, 
+                              per_gpu_capacity=4)   # dont change this
     return config
 
 

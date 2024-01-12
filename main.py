@@ -2,6 +2,7 @@ import torch
 from PIL import Image
 import sys
 import os
+import copy
 cwd = os.getcwd()
 sys.path.append(cwd)
 from aesthetic_scorer import AestheticScorerDiff
@@ -26,8 +27,13 @@ from accelerate.logging import get_logger
 from accelerate import Accelerator
 from absl import app, flags
 from ml_collections import config_flags
+
+from diffusers_patch.ddim_with_kl import ddim_step_KL
+
+
 FLAGS = flags.FLAGS
-config_flags.DEFINE_config_file("config", "config/align_prop.py", "Training configuration.")
+config_flags.DEFINE_config_file("config", "config/align_prop.py:aesthetic", "Training configuration.")
+
 from accelerate.utils import set_seed, ProjectConfiguration
 logger = get_logger(__name__)
 
@@ -72,7 +78,7 @@ def hps_loss_fn(inference_dtype=None, device=None):
         
     def loss_fn(im_pix, prompts):    
         im_pix = ((im_pix / 2) + 0.5).clamp(0, 1) 
-        x_var = torchvision.transforms.Resize(target_size)(im_pix)
+        x_var = torchvision.transforms.Resize(target_size, antialias=False)(im_pix)
         x_var = normalize(x_var).to(im_pix.dtype)        
         caption = tokenizer(prompts)
         caption = caption.to(device)
@@ -100,7 +106,7 @@ def aesthetic_loss_fn(aesthetic_target=None,
     target_size = 224
     def loss_fn(im_pix_un):
         im_pix = ((im_pix_un / 2) + 0.5).clamp(0, 1) 
-        im_pix = torchvision.transforms.Resize(target_size)(im_pix)
+        im_pix = torchvision.transforms.Resize(target_size, antialias=False)(im_pix)
         im_pix = normalize(im_pix).to(im_pix_un.dtype)
         rewards = scorer(im_pix)
         if aesthetic_target is None: # default maximization
@@ -125,7 +131,11 @@ def evaluate(latent,train_neg_prompt_embeds,prompts, pipeline, accelerator, infe
     prompt_embeds = pipeline.text_encoder(prompt_ids)[0]         
     
     all_rgbs_t = []
-    for i, t in tqdm(enumerate(pipeline.scheduler.timesteps), total=len(pipeline.scheduler.timesteps)):
+    for i, t in tqdm(
+        enumerate(pipeline.scheduler.timesteps), 
+        total=len(pipeline.scheduler.timesteps),
+        disable=not accelerator.is_local_main_process
+        ):
         t = torch.tensor([t],
                             dtype=inference_dtype,
                             device=latent.device)
@@ -136,7 +146,7 @@ def evaluate(latent,train_neg_prompt_embeds,prompts, pipeline, accelerator, infe
                 
         grad = (noise_pred_cond - noise_pred_uncond)
         noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad
-        latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
+        latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent, config.sample_eta).prev_sample
     ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
     if "hps" in config.reward_fn:
         loss, rewards = loss_fn(ims, prompts)
@@ -184,13 +194,14 @@ def main(_):
     
     if accelerator.is_main_process:
         wandb_args = {}
+        wandb_args["name"] = config.run_name
         if config.debug:
-            wandb_args = {'mode':"disabled"}        
+            wandb_args.update({'mode':"disabled"})        
         accelerator.init_trackers(
             project_name="align-prop", config=config.to_dict(), init_kwargs={"wandb": wandb_args}
         )
 
-        accelerator.project_configuration.project_dir = os.path.join(config.logdir, wandb.run.name)
+        accelerator.project_configuration.project_dir = os.path.join(config.logdir, config.run_name)
         accelerator.project_configuration.logging_dir = os.path.join(config.logdir, wandb.run.name)    
 
     
@@ -210,7 +221,10 @@ def main(_):
     pipeline.text_encoder.requires_grad_(False)
     pipeline.unet.requires_grad_(False)
 
-
+    unet_pretrained = copy.deepcopy(pipeline.unet)
+    for param in unet_pretrained.parameters():
+        param.requires_grad = False
+    
     # disable safety checker
     pipeline.safety_checker = None    
     
@@ -231,16 +245,18 @@ def main(_):
     # as these weights are only used for inference, keeping weights in full precision is not required.    
     inference_dtype = torch.float32
 
-    if accelerator.mixed_precision == "fp16":
-        inference_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        inference_dtype = torch.bfloat16    
+    # if accelerator.mixed_precision == "fp16":
+    #     inference_dtype = torch.float16
+    # elif accelerator.mixed_precision == "bf16":
+    #     inference_dtype = torch.bfloat16    
 
     # Move unet, vae and text_encoder to device and cast to inference_dtype
     pipeline.vae.to(accelerator.device, dtype=inference_dtype)
     pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
 
-    pipeline.unet.to(accelerator.device, dtype=inference_dtype)    
+    pipeline.unet.to(accelerator.device, dtype=inference_dtype)
+    unet_pretrained.to(accelerator.device, dtype=inference_dtype)
+        
     # Set correct lora layers
     lora_attn_procs = {}
     for name in pipeline.unet.attn_processors.keys():
@@ -271,9 +287,6 @@ def main(_):
     # set up diffusers-friendly checkpoint saving with Accelerate
 
     def save_model_hook(models, weights, output_dir):
-        output_splits = output_dir.split("/")
-        output_splits[1] = wandb.run.name
-        output_dir = "/".join(output_splits)
         assert len(models) == 1
         if isinstance(models[0], AttnProcsLayers):
             pipeline.unet.save_attn_procs(output_dir)
@@ -378,7 +391,7 @@ def main(_):
         raise NotImplementedError
 
     keep_input = True
-    timesteps = pipeline.scheduler.timesteps
+    timesteps = pipeline.scheduler.timesteps #[981, 961, 941, 921,]
     
     eval_prompts, eval_prompt_metadata = zip(
         *[eval_prompt_fn() for _ in range(config.train.batch_size_per_gpu_available * config.max_vis_images)]
@@ -438,14 +451,17 @@ def main(_):
             info_vis = defaultdict(list)
             image_vis_list = []
             
-            for inner_iters in tqdm(list(range(config.train.data_loader_iterations)),position=0,disable=not accelerator.is_local_main_process):
-                latent = torch.randn((config.train.batch_size_per_gpu_available, 4, 64, 64), device=accelerator.device, dtype=inference_dtype)    
+            for inner_iters in tqdm(
+                    list(range(config.train.data_loader_iterations)),
+                    position=0,
+                    disable=not accelerator.is_local_main_process
+                ):
+                latent = torch.randn((config.train.batch_size_per_gpu_available, 4, 64, 64),
+                    device=accelerator.device, dtype=inference_dtype)    
 
                 if accelerator.is_main_process:
+                    logger.info(f"{config.run_name.rsplit('/', 1)[0]} Epoch {epoch}.{inner_iters}: training")
 
-                    logger.info(f"{wandb.run.name} Epoch {epoch}.{inner_iters}: training")
-
-                
                 prompts, prompt_metadata = zip(
                     *[prompt_fn() for _ in range(config.train.batch_size_per_gpu_available)]
                 )
@@ -465,47 +481,84 @@ def main(_):
                 with accelerator.accumulate(unet):
                     with autocast():
                         with torch.enable_grad(): # important b/c don't have on by default in module                        
-
                             keep_input = True
-                            for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
+                            
+                            kl_loss = 0
+                            
+                            for i, t in tqdm(
+                                enumerate(timesteps), 
+                                total=len(timesteps),
+                                disable=not accelerator.is_local_main_process,
+                            ):
                                 t = torch.tensor([t],
-                                                    dtype=inference_dtype,
-                                                    device=latent.device)
+                                        dtype=inference_dtype,
+                                        device=latent.device
+                                    )
                                 t = t.repeat(config.train.batch_size_per_gpu_available)
                                 
                                 if config.grad_checkpoint:
                                     noise_pred_uncond = checkpoint.checkpoint(unet, latent, t, train_neg_prompt_embeds, use_reentrant=False).sample
                                     noise_pred_cond = checkpoint.checkpoint(unet, latent, t, prompt_embeds, use_reentrant=False).sample
+                                    
+                                    old_noise_pred_uncond = checkpoint.checkpoint(unet_pretrained,latent, t, train_neg_prompt_embeds, use_reentrant=False).sample
+                                    old_noise_pred_cond = checkpoint.checkpoint(unet_pretrained,latent, t, prompt_embeds, use_reentrant=False).sample
+                                    
                                 else:
                                     noise_pred_uncond = unet(latent, t, train_neg_prompt_embeds).sample
                                     noise_pred_cond = unet(latent, t, prompt_embeds).sample
-                                                                
+                                
+                                    old_noise_pred_uncond = unet_pretrained(latent, t, train_neg_prompt_embeds).sample
+                                    old_noise_pred_cond = unet_pretrained(latent, t, prompt_embeds).sample    
+                                        
                                 if config.truncated_backprop:
                                     if config.truncated_backprop_rand:
-                                        timestep = random.randint(config.truncated_backprop_minmax[0],config.truncated_backprop_minmax[1])
+                                        timestep = random.randint(
+                                            config.truncated_backprop_minmax[0],
+                                            config.truncated_backprop_minmax[1]
+                                        )
                                         if i < timestep:
                                             noise_pred_uncond = noise_pred_uncond.detach()
                                             noise_pred_cond = noise_pred_cond.detach()
+                                            old_noise_pred_uncond = old_noise_pred_uncond.detach()
+                                            old_noise_pred_cond = old_noise_pred_cond.detach()
                                     else:
                                         if i < config.trunc_backprop_timestep:
                                             noise_pred_uncond = noise_pred_uncond.detach()
                                             noise_pred_cond = noise_pred_cond.detach()
+                                            old_noise_pred_uncond = old_noise_pred_uncond.detach()
+                                            old_noise_pred_cond = old_noise_pred_cond.detach()
 
                                 grad = (noise_pred_cond - noise_pred_uncond)
-                                noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad                
-                                latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
-                                                    
-                            ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
+                                old_grad = (old_noise_pred_cond - old_noise_pred_uncond)
+                                
+                                noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad
+                                old_noise_pred = old_noise_pred_uncond + config.sd_guidance_scale * old_grad 
+                                               
+                                # latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent).prev_sample
+                                
+                                latent, kl_terms = ddim_step_KL(
+                                    pipeline.scheduler,
+                                    noise_pred,   # (2,4,64,64),
+                                    old_noise_pred, # (2,4,64,64),
+                                    t[0].long(),
+                                    latent,
+                                    eta=config.sample_eta,  # 1.0
+                                )
+                                kl_loss += torch.mean(kl_terms).to(inference_dtype)
+                                          
+                            ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample  # latent entries around -5 - +7
                             
                             if "hps" in config.reward_fn:
                                 loss, rewards = loss_fn(ims, prompts)
                             else:
                                 loss, rewards = loss_fn(ims)
                             
-                            loss =  loss.sum()
-                            loss = loss/config.train.batch_size_per_gpu_available
-                            loss = loss * config.train.loss_coeff
-
+                            # loss =  loss.sum()
+                            # loss = loss/config.train.batch_size_per_gpu_available
+                            loss = loss.mean() * config.train.loss_coeff
+                            
+                            total_loss = loss + config.train.kl_weight*kl_loss
+                            
                             rewards_mean = rewards.mean()
                             rewards_std = rewards.std()
                             
@@ -514,12 +567,14 @@ def main(_):
                                 info_vis["rewards_img"].append(rewards.clone().detach())
                                 info_vis["prompts"] = list(info_vis["prompts"]) + list(prompts)
                             
-                            info["loss"].append(loss)
+                            info["loss"].append(total_loss)
+                            info["KL-entropy"].append(kl_loss)
+                            
                             info["rewards"].append(rewards_mean)
                             info["rewards_std"].append(rewards_std)
                             
                             # backward pass
-                            accelerator.backward(loss)
+                            accelerator.backward(total_loss)
                             if accelerator.sync_gradients:
                                 accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
                             optimizer.step()
@@ -551,8 +606,7 @@ def main(_):
                         eval_images = torch.cat(all_eval_images)
                         eval_image_vis = []
                         if accelerator.is_main_process:
-
-                            name_val = wandb.run.name
+                            name_val = config.run_name
                             log_dir = f"logs/{name_val}/eval_vis"
                             os.makedirs(log_dir, exist_ok=True)
                             for i, eval_image in enumerate(eval_images):

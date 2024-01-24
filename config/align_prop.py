@@ -122,6 +122,9 @@ def aesthetic():
     
     config.sample_eta = 1.0  # This is to ensure we have noise during sampling
     
+    config.eval_div_freq = 6
+    config.num_samples_Div = 32
+    
     config.save_freq = 5
     
     config.num_epochs = 60

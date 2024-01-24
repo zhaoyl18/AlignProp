@@ -108,13 +108,13 @@ def aesthetic_loss_fn(aesthetic_target=None,
         im_pix = ((im_pix_un / 2) + 0.5).clamp(0, 1) 
         im_pix = torchvision.transforms.Resize(target_size, antialias=False)(im_pix)
         im_pix = normalize(im_pix).to(im_pix_un.dtype)
-        rewards = scorer(im_pix)
+        rewards, embeds = scorer(im_pix)
         if aesthetic_target is None: # default maximization
             loss = -1 * rewards
         else:
             # using L1 to keep on same scale
             loss = abs(rewards - aesthetic_target)
-        return loss * grad_scale, rewards
+        return loss * grad_scale, rewards, embeds
     return loss_fn
 
 
@@ -151,8 +151,8 @@ def evaluate(latent,train_neg_prompt_embeds,prompts, pipeline, accelerator, infe
     if "hps" in config.reward_fn:
         loss, rewards = loss_fn(ims, prompts)
     else:    
-        _, rewards = loss_fn(ims)
-    return ims, rewards
+        _, rewards, embeds = loss_fn(ims)
+    return ims, rewards, embeds
 
     
     
@@ -396,6 +396,11 @@ def main(_):
     eval_prompts, eval_prompt_metadata = zip(
         *[eval_prompt_fn() for _ in range(config.train.batch_size_per_gpu_available * config.max_vis_images)]
     )    
+    
+    with open('assets/simple_animals.txt', "r") as f:
+        lines = [line.strip() for line in f.readlines()]
+    Div_prompts = lines[:config.num_samples_Div]
+    print(Div_prompts)
 
     if config.resume_from:
         logger.info(f"Resuming from {config.resume_from}")
@@ -418,7 +423,7 @@ def main(_):
             latent = torch.randn((config.train.batch_size_per_gpu_available*config.max_vis_images, 4, 64, 64), device=accelerator.device, dtype=inference_dtype)        
         with torch.no_grad():
             for index in range(config.max_vis_images):
-                ims, rewards = evaluate(latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],train_neg_prompt_embeds, eval_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], pipeline, accelerator, inference_dtype,config, loss_fn)
+                ims, rewards, _ = evaluate(latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],train_neg_prompt_embeds, eval_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], pipeline, accelerator, inference_dtype,config, loss_fn)
                 all_eval_images.append(ims)
                 all_eval_rewards.append(rewards)
         eval_rewards = torch.cat(all_eval_rewards)
@@ -551,7 +556,7 @@ def main(_):
                             if "hps" in config.reward_fn:
                                 loss, rewards = loss_fn(ims, prompts)
                             else:
-                                loss, rewards = loss_fn(ims)
+                                loss, rewards, _ = loss_fn(ims)
                             
                             # loss =  loss.sum()
                             # loss = loss/config.train.batch_size_per_gpu_available
@@ -597,7 +602,15 @@ def main(_):
                             latent = torch.randn((config.train.batch_size_per_gpu_available*config.max_vis_images, 4, 64, 64), device=accelerator.device, dtype=inference_dtype)                                
                         with torch.no_grad():
                             for index in range(config.max_vis_images):
-                                ims, rewards = evaluate(latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],train_neg_prompt_embeds, eval_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], pipeline, accelerator, inference_dtype,config, loss_fn)
+                                ims, rewards, _ = evaluate(
+                                    latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],
+                                    train_neg_prompt_embeds, eval_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], 
+                                    pipeline, 
+                                    accelerator, 
+                                    inference_dtype,
+                                    config, 
+                                    loss_fn
+                                )
                                 all_eval_images.append(ims)
                                 all_eval_rewards.append(rewards)
                         eval_rewards = torch.cat(all_eval_rewards)
@@ -619,14 +632,67 @@ def main(_):
                                 eval_image_vis.append(wandb.Image(pil, caption=f"{prompt:.25} | {reward:.2f}"))                    
                             accelerator.log({"eval_images": eval_image_vis},step=global_step)
                     
+                    if global_step % config.eval_div_freq ==0:
+
+                        div_embeds = []
+                        div_images = []
+                        div_rewards = []
+                             
+                        per_gpu_images = config.num_samples_Div  # 32
+                        per_gpu_iters = per_gpu_images // config.train.batch_size_per_gpu_available # 32/4 = 8
+                                          
+                        latent = torch.randn((per_gpu_images, 4, 64, 64), 
+                            device=accelerator.device, dtype=inference_dtype)
+                        
+                        with torch.no_grad():
+                            for index in range(per_gpu_iters):
+                                ims, rewards, embeds = evaluate(
+                                    latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],
+                                    train_neg_prompt_embeds, 
+                                    Div_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], 
+                                    pipeline, 
+                                    accelerator, 
+                                    inference_dtype,
+                                    config, 
+                                    loss_fn
+                                )
+                                div_images.append(ims)
+                                div_rewards.append(rewards)
+                                div_embeds.append(embeds)
+
+                        div_embeds = torch.cat(div_embeds)
+                        assert div_embeds.shape[0] == config.num_samples_Div
+                        
+                        sim_matrix = torch.mm(div_embeds, div_embeds.t()) # Calculate the average similarity including self-similarity
+                        similarity_mean = sim_matrix.mean()
+                        similarity_std = sim_matrix.std()
+                        
+                        div_images = torch.cat(div_images)
+                        div_rewards = torch.cat(div_rewards)
+                        
+                        div_image_vis = []
+                        if accelerator.is_main_process:
+                            for i, div_image in enumerate(div_images):
+                                div_image = (div_image.clone().detach() / 2 + 0.5).clamp(0, 1)
+                                pil = Image.fromarray((div_image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+                                prompt = Div_prompts[i]
+                                pil = pil.resize((256, 256))
+                                reward = div_rewards[i]
+                                div_image_vis.append(wandb.Image(pil, caption=f"{prompt:.25} | {reward:.2f}"))                    
+                            accelerator.log({"div_images": div_image_vis},step=global_step)
+                        
                     logger.info("Logging")
                     
                     info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
                     info = accelerator.reduce(info, reduction="mean")
                     logger.info(f"loss: {info['loss']}, rewards: {info['rewards']}")
 
-                    info.update({"epoch": epoch, "inner_epoch": inner_iters, "eval_rewards":eval_reward_mean,"eval_rewards_std":eval_reward_std})
-                    accelerator.log(info, step=global_step)
+                    info.update({"epoch": epoch, 
+                                 "inner_epoch": inner_iters, 
+                                 "eval_rewards":eval_reward_mean,
+                                 "eval_rewards_std":eval_reward_std,
+                                 "Div_mean":similarity_mean,
+                                 "Div_std":similarity_std,})
 
                     if config.visualize_train:
                         ims = torch.cat(info_vis["image"])

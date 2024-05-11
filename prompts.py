@@ -36,5 +36,8 @@ def simple_animals():
 def eval_simple_animals():
     return from_file("eval_simple_animals.txt")
 
+def eval_aesthetic_animals():
+    return from_file("eval_aesthetic_animals.txt")
+
 def eval_hps_v2_all():
     return from_file("hps_v2_all_eval.txt")

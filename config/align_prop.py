@@ -104,16 +104,16 @@ def set_config_batch(config,total_samples_per_epoch, total_batch_size, per_gpu_c
 
 def aesthetic():
     config = general()
-    config.num_epochs = 200
+    config.num_epochs = 60
     config.prompt_fn = "simple_animals"
 
-    config.eval_prompt_fn = "eval_simple_animals"
+    config.eval_prompt_fn = "eval_aesthetic_animals"
 
     config.reward_fn = 'aesthetic' # CLIP or imagenet or .... or .. 
     config.train.max_grad_norm = 5.0    
     config.train.loss_coeff = 0.01
     config.train.learning_rate = 1e-3
-    config.max_vis_images = 4
+    config.max_vis_images = 5
     config.train.adam_weight_decay = 0.1
     
     config.train.kl_weight = 0 # Adjust this to different regularization level.
@@ -122,13 +122,13 @@ def aesthetic():
     
     config.sample_eta = 1.0  # This is to ensure we have noise during sampling
     
-    config.eval_div_freq = 6
+    config.eval_div_freq = 999999
     config.num_samples_Div = 32
     
-    config.save_freq = 5
+    config.save_freq = 1
     
     config.num_epochs = 60
-    config.num_checkpoint_limit = 20
+    config.num_checkpoint_limit = 999999
     config.truncated_backprop_rand = True
     config.truncated_backprop_minmax = (0,50)
     config.trunc_backprop_timestep = 40
@@ -136,8 +136,8 @@ def aesthetic():
     config.truncated_backprop = True  # If you want full backward prop and no truncation, set to False
     
     config = set_config_batch(config,
-                              total_samples_per_epoch=256,
-                              total_batch_size= 128, 
+                              total_samples_per_epoch=64*4,
+                              total_batch_size= 32*4, 
                               per_gpu_capacity=4)   # dont change this
     return config
 

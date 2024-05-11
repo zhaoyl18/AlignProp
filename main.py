@@ -195,6 +195,7 @@ def main(_):
     if accelerator.is_main_process:
         wandb_args = {}
         wandb_args["name"] = config.run_name
+        wandb_args["entity"] = "fderc_diffusion"
         if config.debug:
             wandb_args.update({'mode':"disabled"})        
         accelerator.init_trackers(
@@ -400,7 +401,7 @@ def main(_):
     with open('assets/simple_animals.txt', "r") as f:
         lines = [line.strip() for line in f.readlines()]
     Div_prompts = lines[:config.num_samples_Div]
-    print(Div_prompts)
+    # print(Div_prompts)
 
     if config.resume_from:
         logger.info(f"Resuming from {config.resume_from}")
@@ -632,54 +633,54 @@ def main(_):
                                 eval_image_vis.append(wandb.Image(pil, caption=f"{prompt:.25} | {reward:.2f}"))                    
                             accelerator.log({"eval_images": eval_image_vis},step=global_step)
                     
-                    if global_step % config.eval_div_freq ==0:
+                    # if global_step % config.eval_div_freq ==0:
 
-                        div_embeds = []
-                        div_images = []
-                        div_rewards = []
+                    #     div_embeds = []
+                    #     div_images = []
+                    #     div_rewards = []
                              
-                        per_gpu_images = config.num_samples_Div  # 32
-                        per_gpu_iters = per_gpu_images // config.train.batch_size_per_gpu_available # 32/4 = 8
+                    #     per_gpu_images = config.num_samples_Div  # 32
+                    #     per_gpu_iters = per_gpu_images // config.train.batch_size_per_gpu_available # 32/4 = 8
                                           
-                        latent = torch.randn((per_gpu_images, 4, 64, 64), 
-                            device=accelerator.device, dtype=inference_dtype)
+                    #     latent = torch.randn((per_gpu_images, 4, 64, 64), 
+                    #         device=accelerator.device, dtype=inference_dtype)
                         
-                        with torch.no_grad():
-                            for index in range(per_gpu_iters):
-                                ims, rewards, embeds = evaluate(
-                                    latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],
-                                    train_neg_prompt_embeds, 
-                                    Div_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], 
-                                    pipeline, 
-                                    accelerator, 
-                                    inference_dtype,
-                                    config, 
-                                    loss_fn
-                                )
-                                div_images.append(ims)
-                                div_rewards.append(rewards)
-                                div_embeds.append(embeds)
+                    #     with torch.no_grad():
+                    #         for index in range(per_gpu_iters):
+                    #             ims, rewards, embeds = evaluate(
+                    #                 latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],
+                    #                 train_neg_prompt_embeds, 
+                    #                 Div_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], 
+                    #                 pipeline, 
+                    #                 accelerator, 
+                    #                 inference_dtype,
+                    #                 config, 
+                    #                 loss_fn
+                    #             )
+                    #             div_images.append(ims)
+                    #             div_rewards.append(rewards)
+                    #             div_embeds.append(embeds)
 
-                        div_embeds = torch.cat(div_embeds)
-                        assert div_embeds.shape[0] == config.num_samples_Div
+                    #     div_embeds = torch.cat(div_embeds)
+                    #     assert div_embeds.shape[0] == config.num_samples_Div
                         
-                        sim_matrix = torch.mm(div_embeds, div_embeds.t()) # Calculate the average similarity including self-similarity
-                        similarity_mean = sim_matrix.mean()
-                        similarity_std = sim_matrix.std()
+                    #     sim_matrix = torch.mm(div_embeds, div_embeds.t()) # Calculate the average similarity including self-similarity
+                    #     similarity_mean = sim_matrix.mean()
+                    #     similarity_std = sim_matrix.std()
                         
-                        div_images = torch.cat(div_images)
-                        div_rewards = torch.cat(div_rewards)
+                    #     div_images = torch.cat(div_images)
+                    #     div_rewards = torch.cat(div_rewards)
                         
-                        div_image_vis = []
-                        if accelerator.is_main_process:
-                            for i, div_image in enumerate(div_images):
-                                div_image = (div_image.clone().detach() / 2 + 0.5).clamp(0, 1)
-                                pil = Image.fromarray((div_image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
-                                prompt = Div_prompts[i]
-                                pil = pil.resize((256, 256))
-                                reward = div_rewards[i]
-                                div_image_vis.append(wandb.Image(pil, caption=f"{prompt:.25} | {reward:.2f}"))                    
-                            accelerator.log({"div_images": div_image_vis},step=global_step)
+                    #     div_image_vis = []
+                    #     if accelerator.is_main_process:
+                    #         for i, div_image in enumerate(div_images):
+                    #             div_image = (div_image.clone().detach() / 2 + 0.5).clamp(0, 1)
+                    #             pil = Image.fromarray((div_image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+                    #             prompt = Div_prompts[i]
+                    #             pil = pil.resize((256, 256))
+                    #             reward = div_rewards[i]
+                    #             div_image_vis.append(wandb.Image(pil, caption=f"{prompt:.25} | {reward:.2f}"))                    
+                    #         accelerator.log({"div_images": div_image_vis},step=global_step)
                         
                     logger.info("Logging")
                     
@@ -690,9 +691,8 @@ def main(_):
                     info.update({"epoch": epoch, 
                                  "inner_epoch": inner_iters, 
                                  "eval_rewards":eval_reward_mean,
-                                 "eval_rewards_std":eval_reward_std,
-                                 "Div_mean":similarity_mean,
-                                 "Div_std":similarity_std,})
+                                 "eval_rewards_std":eval_reward_std
+                                 })
 
                     if config.visualize_train:
                         ims = torch.cat(info_vis["image"])

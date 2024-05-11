@@ -192,12 +192,17 @@ def evaluate_soup():
 
 
 def evaluate():
-    config = general()
+    config = aesthetic()
+    
+    config.resume_from = 'logs/aesthetic_ckpt/logs/golden-meadow-789/checkpoints/checkpoint_12'
     config.reward_fn = "aesthetic"
-    config.prompt_fn = "eval_simple_animals"
+    
+    config.prompt_fn = "eval_aesthetic_animals"
+    config.eval_prompt_fn = "eval_aesthetic_animals"
     config.only_eval = True
     config.same_evaluation = True
-    config.max_vis_images = 10
+    config.max_vis_images = 32
+    
     config = set_config_batch(config, total_samples_per_epoch=256,total_batch_size= 128, per_gpu_capacity=4)
     return config
 

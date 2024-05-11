@@ -444,9 +444,10 @@ def main(_):
                 eval_image = (eval_image.clone().detach() / 2 + 0.5).clamp(0, 1)
                 pil = Image.fromarray((eval_image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
                 prompt = eval_prompts[i]
-                pil.save(f"{log_dir}/{i:03d}_{prompt}.png")
-                pil = pil.resize((256, 256))
                 reward = eval_rewards[i]
+                pil.save(f"{log_dir}/{i:03d}_{prompt}_{reward:.3f}.png")
+                
+                pil = pil.resize((256, 256))
                 eval_image_vis.append(wandb.Image(pil, caption=f"{prompt:.25} | {reward:.2f}"))                    
             accelerator.log({"eval_images": eval_image_vis},step=global_step)        
     else:

@@ -104,7 +104,7 @@ def set_config_batch(config,total_samples_per_epoch, total_batch_size, per_gpu_c
 
 def aesthetic():
     config = general()
-    config.num_epochs = 60
+    config.num_epochs = 30
     config.prompt_fn = "simple_animals"
 
     config.eval_prompt_fn = "eval_aesthetic_animals"
@@ -127,7 +127,6 @@ def aesthetic():
     
     config.save_freq = 1
     
-    config.num_epochs = 60
     config.num_checkpoint_limit = 999999
     config.truncated_backprop_rand = True
     config.truncated_backprop_minmax = (0,50)
@@ -194,7 +193,7 @@ def evaluate_soup():
 def evaluate():
     config = aesthetic()
     
-    config.resume_from = 'logs/aesthetic_ckpt/logs/golden-meadow-789/checkpoints/checkpoint_12'
+    # config.resume_from = 'logs/aesthetic_ckpt/logs/golden-meadow-789/checkpoints/checkpoint_12'
     config.reward_fn = "aesthetic"
     
     config.prompt_fn = "eval_aesthetic_animals"

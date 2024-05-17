@@ -119,7 +119,7 @@ def aesthetic_loss_fn(aesthetic_target=None,
 
 
 
-def evaluate(latent,train_neg_prompt_embeds,prompts, pipeline, accelerator, inference_dtype, config, loss_fn):
+def evaluate(latent,train_neg_prompt_embeds,prompts, pipeline, unet_pretrained, accelerator, inference_dtype, config, loss_fn):
     prompt_ids = pipeline.tokenizer(
         prompts,
         return_tensors="pt",
@@ -131,6 +131,8 @@ def evaluate(latent,train_neg_prompt_embeds,prompts, pipeline, accelerator, infe
     prompt_embeds = pipeline.text_encoder(prompt_ids)[0]         
     
     all_rgbs_t = []
+    kl_loss = 0.0
+    
     for i, t in tqdm(
         enumerate(pipeline.scheduler.timesteps), 
         total=len(pipeline.scheduler.timesteps),
@@ -143,16 +145,31 @@ def evaluate(latent,train_neg_prompt_embeds,prompts, pipeline, accelerator, infe
 
         noise_pred_uncond = pipeline.unet(latent, t, train_neg_prompt_embeds).sample
         noise_pred_cond = pipeline.unet(latent, t, prompt_embeds).sample
+        
+        old_noise_pred_uncond = unet_pretrained(latent, t, train_neg_prompt_embeds).sample
+        old_noise_pred_cond = unet_pretrained(latent, t, prompt_embeds).sample
                 
         grad = (noise_pred_cond - noise_pred_uncond)
+        old_grad = (old_noise_pred_cond - old_noise_pred_uncond)
+        
         noise_pred = noise_pred_uncond + config.sd_guidance_scale * grad
-        latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent, config.sample_eta).prev_sample
+        old_noise_pred = old_noise_pred_uncond + config.sd_guidance_scale * old_grad
+        
+        # latent = pipeline.scheduler.step(noise_pred, t[0].long(), latent, config.sample_eta).prev_sample
+        latent, kl_terms = ddim_step_KL(pipeline.scheduler,
+                                    noise_pred,   # (2,4,64,64),
+                                    old_noise_pred, # (2,4,64,64),
+                                    t[0].long(),
+                                    latent,
+                                    eta=config.sample_eta)
+        kl_loss += torch.mean(kl_terms).to(inference_dtype)
+        
     ims = pipeline.vae.decode(latent.to(pipeline.vae.dtype) / 0.18215).sample
     if "hps" in config.reward_fn:
         loss, rewards = loss_fn(ims, prompts)
     else:    
         _, rewards, embeds = loss_fn(ims)
-    return ims, rewards, embeds
+    return ims, rewards, kl_loss, embeds
 
     
     
@@ -417,19 +434,39 @@ def main(_):
 
         all_eval_images = []
         all_eval_rewards = []
+        all_kl_loss = []
         if config.same_evaluation:
             generator = torch.cuda.manual_seed(config.seed)
             latent = torch.randn((config.train.batch_size_per_gpu_available*config.max_vis_images, 4, 64, 64), device=accelerator.device, dtype=inference_dtype, generator=generator)    
         else:
             latent = torch.randn((config.train.batch_size_per_gpu_available*config.max_vis_images, 4, 64, 64), device=accelerator.device, dtype=inference_dtype)        
         with torch.no_grad():
-            for index in range(config.max_vis_images):
-                ims, rewards, _ = evaluate(latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],train_neg_prompt_embeds, eval_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], pipeline, accelerator, inference_dtype,config, loss_fn)
+            for index in tqdm(
+                    list(range(config.max_vis_images)),
+                    position=0,
+                    disable=not accelerator.is_local_main_process
+                ):
+                ims, rewards, kl_loss, _ = evaluate(latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],
+                                           train_neg_prompt_embeds, 
+                                           eval_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], 
+                                           pipeline, 
+                                           unet_pretrained,
+                                           accelerator, 
+                                           inference_dtype,
+                                           config, 
+                                           loss_fn)
                 all_eval_images.append(ims)
                 all_eval_rewards.append(rewards)
+                all_kl_loss.append(kl_loss)
+        
         eval_rewards = torch.cat(all_eval_rewards)
         eval_reward_mean = eval_rewards.mean()
+        
+        all_kl_loss = [tensor.unsqueeze(0) if tensor.dim() == 0 else tensor for tensor in all_kl_loss]
+        eval_KL = torch.cat(all_kl_loss)
+        
         print("Evaluation results", eval_reward_mean)
+        print("KL Entropy:", eval_KL.mean())
         eval_images = torch.cat(all_eval_images)
         eval_image_vis = []
         if accelerator.is_main_process:
@@ -449,7 +486,12 @@ def main(_):
                 
                 pil = pil.resize((256, 256))
                 eval_image_vis.append(wandb.Image(pil, caption=f"{prompt:.25} | {reward:.2f}"))                    
-            accelerator.log({"eval_images": eval_image_vis},step=global_step)        
+            accelerator.log({"eval_images": eval_image_vis},step=global_step)   
+            accelerator.log({
+                            "eval_reward_mean": eval_reward_mean,
+                            "eval_reward_std": eval_rewards.std(),
+                            "eval_KL_entropy": eval_KL.mean(),
+                        },step=global_step)     
     else:
         #################### TRAINING ####################        
         for epoch in list(range(first_epoch, config.num_epochs)):
@@ -604,10 +646,11 @@ def main(_):
                             latent = torch.randn((config.train.batch_size_per_gpu_available*config.max_vis_images, 4, 64, 64), device=accelerator.device, dtype=inference_dtype)                                
                         with torch.no_grad():
                             for index in range(config.max_vis_images):
-                                ims, rewards, _ = evaluate(
+                                ims, rewards, _, _ = evaluate(
                                     latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],
                                     train_neg_prompt_embeds, eval_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], 
                                     pipeline, 
+                                    unet_pretrained,
                                     accelerator, 
                                     inference_dtype,
                                     config, 
@@ -648,7 +691,7 @@ def main(_):
                         
                     #     with torch.no_grad():
                     #         for index in range(per_gpu_iters):
-                    #             ims, rewards, embeds = evaluate(
+                    #             ims, rewards, _, embeds = evaluate(
                     #                 latent[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)],
                     #                 train_neg_prompt_embeds, 
                     #                 Div_prompts[config.train.batch_size_per_gpu_available*index:config.train.batch_size_per_gpu_available *(index+1)], 

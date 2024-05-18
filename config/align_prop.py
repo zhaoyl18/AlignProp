@@ -104,8 +104,9 @@ def set_config_batch(config,total_samples_per_epoch, total_batch_size, per_gpu_c
 
 def aesthetic():
     config = general()
-    config.num_epochs = 30
+    config.num_epochs = 60
     config.prompt_fn = "simple_animals"
+    config.resume_from = 'aesthetic_ckpt/golden-meadow-789/checkpoints'
 
     config.eval_prompt_fn = "eval_aesthetic_animals"
 

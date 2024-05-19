@@ -737,6 +737,8 @@ def main(_):
                                  "eval_rewards":eval_reward_mean,
                                  "eval_rewards_std":eval_reward_std
                                  })
+                    
+                    accelerator.log(info, step=global_step)
 
                     if config.visualize_train:
                         ims = torch.cat(info_vis["image"])
